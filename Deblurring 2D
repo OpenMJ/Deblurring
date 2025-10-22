@@ -1,0 +1,89 @@
+% Deblurring_2D_quasiNewton.m
+clear all
+close all
+
+% Grid size
+N = 100;
+dx = 1/N;
+x = linspace(0,1,N);
+y = linspace(0,1,N);
+[X,Y] = meshgrid(x,y);
+
+% True model: 2D Gaussian
+sigma_model = 0.1;
+m_true = exp(-((X-0.5).^2 + (Y-0.5).^2)/(2*sigma_model^2));
+
+% Initial guess: blurred version of model
+m_ini = imgaussfilt(m_true,10);
+
+% Blurring kernel (Gaussian PSF)
+sigma_blur = 0.05;
+[Xr,Yr] = meshgrid(linspace(-0.5,0.5,N), linspace(-0.5,0.5,N));
+PSF = exp(-(Xr.^2 + Yr.^2)/(2*sigma_blur^2));
+PSF = PSF / sum(PSF(:));  % Normalize
+
+% Forward modeling: blurred data
+d = conv2(m_true, PSF, 'same');
+
+% Flatten for optimization
+m_ini_vec = m_ini(:);
+d_vec = d(:);
+
+% Objective function for fminunc
+ob_fun_linear_2D = @(m_vec) obj_and_grad(m_vec, PSF, d_vec, N);
+
+% Optimization options
+options = optimoptions('fminunc', ...
+              HessianApproximation="lbfgs",...
+              SpecifyObjectiveGradient=true,...
+              Algorithm="quasi-newton",...
+              ObjectiveLimit=1e-6,...    
+              MaxIterations=500,...
+              MaxFunctionEvaluations=1000,...
+              Display="final-detailed",...
+              OptimalityTolerance=1e-8);
+
+% Run inversion
+m_est_vec = fminunc(ob_fun_linear_2D, m_ini_vec, options);
+m_est = reshape(m_est_vec, N, N);
+
+% Plot results
+figure
+subplot(1,3,1)
+imagesc(x,y,m_true)
+title('True Model')
+axis image; colorbar
+
+subplot(1,3,2)
+imagesc(x,y,m_ini)
+title('Initial Guess')
+axis image; colorbar
+
+subplot(1,3,3)
+imagesc(x,y,m_est)
+title('Estimated Model')
+axis image; colorbar
+
+% --- Objective and Gradient Function ---
+function [obj, grad] = obj_and_grad(m_vec, PSF, d_vec, N)
+    m = reshape(m_vec, N, N);
+    d_est = conv2(m, PSF, 'same');
+    residual = d_est(:) - d_vec;
+    obj = norm(residual)^2;
+    grad = 2 * conv2(residual_reshape(residual, N), rot90(PSF,2), 'same');
+    grad = grad(:);
+end
+
+function R = residual_reshape(r, N)
+    R = reshape(r, N, N);
+end
+
+
+
+
+
+
+
+
+
+
