@@ -1,0 +1,177 @@
+% Deblurring_2D_quasiNewton_sharp.m
+clear; close all; clc;
+
+% -------------------- Controls --------------------
+N = 128;                    % grid size
+use_noise = true;           % add noise to the data (blurred image)
+snr_dB    = 100;             % SNR of the data if use_noise = true
+
+reg_type  = 'tv';           % 'none' | 'tikh' | 'tv'
+lambda    = 1e-2;           % regularization strength (tune per SNR)
+eps_tv    = 1e-3;           % TV smoothing epsilon (keeps gradient Lipschitz)
+
+rng(0)                      % reproducibility
+
+% -------------------- Grid --------------------
+x = linspace(0,1,N);  y = linspace(0,1,N);
+[X,Y] = meshgrid(x,y);
+dx = 1/N;
+
+% -------------------- True model: sharp geometry --------------------
+m_true = zeros(N,N);
+
+% Square (amplitude 1.0) centered at (0.30, 0.30), side length 0.24
+sq_mask = (abs(X-0.30) <= 0.12) & (abs(Y-0.30) <= 0.12);
+m_true = m_true + 1.0*sq_mask;
+
+% Disk (amplitude 0.8) centered at (0.70, 0.70), radius 0.09
+disk_mask = (X-0.70).^2 + (Y-0.70).^2 <= 0.09^2;
+m_true = m_true + 0.8*disk_mask;
+
+% Thin vertical bar (amplitude 0.6) around x=0.20
+bar_mask = (abs(X-0.20) <= 0.01) & (Y >= 0.15 & Y <= 0.85);
+m_true = m_true + 0.6*bar_mask;
+
+% Clip to [0,1] so it's a clean piecewise-constant image
+m_true = min(m_true, 1.0);
+
+% -------------------- PSF (Gaussian blur) --------------------
+% Choose blur sigma in physical units, then convert to pixels
+sigma_blur_phys = 0.06;             % strong blur so data looks very different
+sigma_px = sigma_blur_phys / dx;    % sigma in pixels
+
+% Build centered PSF on an N-by-N grid (periodic indices around center)
+[Xr, Yr] = meshgrid( (-floor(N/2):ceil(N/2)-1), (-floor(N/2):ceil(N/2)-1) );
+PSF = exp(-(Xr.^2 + Yr.^2)/(2*sigma_px^2));
+PSF = PSF / sum(PSF(:));  % normalize to unit sum
+
+% -------------------- Data (blurred, optionally noisy) --------------------
+A_m_true = conv2(m_true, PSF, 'same');   % forward model
+if use_noise
+    signal_power = mean(A_m_true(:).^2);
+    noise_power  = signal_power / 10^(snr_dB/10);
+    d = A_m_true + sqrt(noise_power) * randn(size(A_m_true));
+else
+    d = A_m_true;
+end
+
+% -------------------- Initial guess --------------------
+% Start from the blurred data itself (a natural, informative initial guess)
+m_ini = d;
+m_ini_vec = m_ini(:);
+d_vec     = d(:);
+
+% -------------------- Objective & optimization --------------------
+switch lower(reg_type)
+    case 'none'
+        obj = @(m_vec) obj_grad_data(m_vec, PSF, d_vec, N);
+    case 'tikh'
+        obj = @(m_vec) obj_grad_tikh(m_vec, PSF, d_vec, N, lambda);
+    case 'tv'
+        obj = @(m_vec) obj_grad_tv(m_vec, PSF, d_vec, N, lambda, eps_tv);
+    otherwise
+        error('Unknown reg_type. Use ''none'', ''tikh'', or ''tv''.');
+end
+
+options = optimoptions('fminunc', ...
+    HessianApproximation="lbfgs", ...
+    SpecifyObjectiveGradient=true, ...
+    Algorithm="quasi-newton", ...
+    Display="final-detailed", ...
+    MaxIterations=400, ...
+    MaxFunctionEvaluations=4000, ...
+    OptimalityTolerance=1e-8, ...
+    StepTolerance=1e-12);
+
+[m_est_vec, fval, exitflag, output] = fminunc(obj, m_ini_vec, options);
+m_est = reshape(m_est_vec, N, N);
+
+% -------------------- Plots --------------------
+figure('Color','w');
+subplot(1,3,1)
+imagesc(x, y, m_true); axis image; colorbar; colormap gray
+title('True model (sharp)')
+
+subplot(1,3,2)
+imagesc(x, y, d); axis image; colorbar; colormap gray
+if use_noise
+    title(sprintf('Data: blurred + noise (SNR = %g dB)', snr_dB))
+else
+    title('Data: blurred (noise-free)')
+end
+
+subplot(1,3,3)
+imagesc(x, y, m_est); axis image; colorbar; colormap gray
+switch lower(reg_type)
+    case 'none'
+        ttl = 'Reconstruction (no regularization)';
+    case 'tikh'
+        ttl = sprintf('Reconstruction (Tikhonov, \\lambda = %.1e)', lambda);
+    case 'tv'
+        ttl = sprintf('Reconstruction (TV, \\lambda = %.1e, \\epsilon = %.1e)', lambda, eps_tv);
+end
+title(ttl)
+
+% Optional diagnostics
+rel_err = norm(m_est(:) - m_true(:)) / norm(m_true(:));
+fprintf('Relative reconstruction error: %.3e\n', rel_err);
+
+% -------------------- Objective/gradient helpers --------------------
+function [obj, grad] = obj_grad_data(m_vec, PSF, d_vec, N)
+    % Pure data term: f(m) = ||A m - d||^2
+    m = reshape(m_vec, N, N);
+    d_est = conv2(m, PSF, 'same');
+    r = d_est(:) - d_vec;                 % residual
+    obj = r' * r;
+    % gradient = 2 A^T r  (A^T = correlation with flipped PSF)
+    Ar = conv2(reshape(r, N, N), rot90(PSF,2), 'same');
+    grad = 2 * Ar(:);
+end
+
+function [obj, grad] = obj_grad_tikh(m_vec, PSF, d_vec, N, lambda)
+    % Tikhonov (ridge): f(m) = ||A m - d||^2 + lambda^2 ||m||^2
+    m = reshape(m_vec, N, N);
+    d_est = conv2(m, PSF, 'same');
+    r = d_est(:) - d_vec;
+    obj = r' * r + lambda^2 * (m_vec' * m_vec);
+    Ar = conv2(reshape(r, N, N), rot90(PSF,2), 'same');
+    grad = 2 * (Ar(:) + lambda^2 * m_vec);
+end
+
+function [obj, grad] = obj_grad_tv(m_vec, PSF, d_vec, N, lambda, eps_tv)
+    % Smoothed isotropic TV: f(m) = ||A m - d||^2 + lambda^2 * sum sqrt(|∇m|^2 + eps^2)
+    m = reshape(m_vec, N, N);
+    d_est = conv2(m, PSF, 'same');
+    r = d_est(:) - d_vec;
+    obj_data = r' * r;
+
+    % forward differences (Neumann at right/bottom edges)
+    dxm = [diff(m,1,2), zeros(N,1)];
+    dym = [diff(m,1,1); zeros(1,N)];
+    g = sqrt(dxm.^2 + dym.^2 + eps_tv^2);
+    obj_tv = sum(g(:));
+
+    % TV gradient: -div(∇m / g)
+    px = dxm ./ g;
+    py = dym ./ g;
+
+    % backward divergence with zero-flux boundary
+    divx = [px(:,1), px(:,2:end) - px(:,1:end-1)];
+    divy = [py(1,:); py(2:end,:) - py(1:end-1,:)];
+    grad_tv = -(divx + divy);   % same size as m
+
+    % total objective and gradient
+    obj = obj_data + lambda^2 * obj_tv;
+    Ar = conv2(reshape(r, N, N), rot90(PSF,2), 'same');
+    grad = 2 * Ar(:) + lambda^2 * grad_tv(:);
+end
+
+
+
+
+
+
+
+
+
+
